@@ -1,3 +1,10 @@
+//! Binaries for this test should be built with `fast-runtime` feature enabled:
+//! `cargo build -r -F fast-runtime -p polkadot-parachain-bin && \`
+//! `cargo build -r -F fast-runtime --bin polkadot --bin polkadot-execute-worker --bin polkadot-prepare-worker`
+//! 
+//! Running with normal runtimes is possible but would take ages. Running fast relay runtime with
+//! normal parachain runtime WILL mess things up.
+
 use tokio::time::Duration;
 use rococo::api::runtime_types::{
 	staging_xcm::v4::{
@@ -9,7 +16,7 @@ use rococo::api::runtime_types::{
 	xcm::{VersionedAssets, VersionedLocation},
 };
 use serde_json::json;
-use std::sync::{Arc, RwLock};
+use std::{fmt::Display, sync::{Arc, RwLock}};
 use subxt::{
 	blocks::ExtrinsicEvents,
 	config::ExtrinsicParams,
@@ -17,14 +24,9 @@ use subxt::{
 	tx::{Payload, Signer},
 	utils::AccountId32,
 };
-// use subxt::config::SubstrateExtrinsicParamsBuilder;
 use subxt::{OnlineClient, PolkadotConfig};
 use subxt_signer::sr25519::dev;
 use zombienet_sdk::{NetworkConfigBuilder, NetworkConfigExt, RegistrationStrategy};
-
-// #[subxt::subxt(runtime_metadata_path = "polkadot_metadata_full.scale")]
-// #[subxt::subxt(runtime_metadata_path = "rococo-metadata.scale")]
-// pub mod rococo {}
 
 mod coretime_rococo;
 mod rococo;
@@ -42,7 +44,14 @@ type CoretimeRuntimeCall = coretime_api::runtime_types::coretime_rococo_runtime:
 type CoretimeUtilityCall = coretime_api::runtime_types::pallet_utility::pallet::Call;
 type CoretimeBrokerCall = coretime_api::runtime_types::pallet_broker::pallet::Call;
 
-// const BEST_BLOCK_HEIGHT: &str = "block_height{status=\"best\"}";
+// On-demand coretime base fee (set at the genesis)
+//
+// NB: This fee MUST always be higher than RC's existential deposit value. Otherwise, when
+//     some insta coretime is bought for the base fee value, it gets transferred from the buyer's
+//     account to the pallet pot and gets burnt immediately if the pot was empty. That
+//     results in everything messed up afterwards when funds have to be withdrawn from the pot and
+//     teleported to the PC as revenue.
+const ON_DEMAND_BASE_FEE: u128 = 50_000_000;
 
 async fn get_total_issuance(
 	relay: OnlineClient<PolkadotConfig>,
@@ -76,7 +85,7 @@ async fn assert_total_issuance(
 	ti: (u128, u128),
 ) {
 	let actual_ti = get_total_issuance(relay, coretime).await;
-	log::info!("Asserting total issuance: actual: {actual_ti:?}, expected: {ti:?}");
+	log::debug!("Asserting total issuance: actual: {actual_ti:?}, expected: {ti:?}");
 	assert_eq!(ti, actual_ti);
 }
 
@@ -84,78 +93,80 @@ type ParaEvents<C> = Arc<RwLock<Vec<(u64, subxt::events::EventDetails<C>)>>>;
 
 async fn para_watcher<C: subxt::Config + Clone>(api: OnlineClient<C>, events: ParaEvents<C>)
 where
-	<C::Header as subxt::config::Header>::Number: std::fmt::Display,
+	<C::Header as subxt::config::Header>::Number: Display,
 {
 	let mut blocks_sub = api.blocks().subscribe_finalized().await.unwrap();
 
 	log::debug!("Starting parachain watcher");
 	while let Some(block) = blocks_sub.next().await {
 		let block = block.unwrap();
-		log::info!("Finalized parachain block {}", block.number());
+		log::debug!("Finalized parachain block {}", block.number());
 
 		for event in block.events().await.unwrap().iter() {
 			let event = event.unwrap();
-			log::info!("Got event: {} :: {}", event.pallet_name(), event.variant_name());
-			events.write().unwrap().push((block.number().into(), event.clone()));
+			log::debug!("Got event: {} :: {}", event.pallet_name(), event.variant_name());
+			{
+				events.write().unwrap().push((block.number().into(), event.clone()));
+			}
 			if event.pallet_name() == "Broker" {
 				match event.variant_name() {
-					"Purchased" => log::info!(
+					"Purchased" => log::trace!(
 						"{:#?}",
 						event
-							.as_event::<coretime_api::broker::events::Purchased>()
+							.as_event::<broker_events::Purchased>()
 							.unwrap()
 							.unwrap()
 					),
-					"SaleInitialized" => log::info!(
+					"SaleInitialized" => log::trace!(
 						"{:#?}",
 						event
-							.as_event::<coretime_api::broker::events::SaleInitialized>()
+							.as_event::<broker_events::SaleInitialized>()
 							.unwrap()
 							.unwrap()
 					),
-					"HistoryInitialized" => log::info!(
+					"HistoryInitialized" => log::trace!(
 						"{:#?}",
 						event
-							.as_event::<coretime_api::broker::events::HistoryInitialized>()
+							.as_event::<broker_events::HistoryInitialized>()
 							.unwrap()
 							.unwrap()
 					),
-					"CoreAssigned" => log::info!(
+					"CoreAssigned" => log::trace!(
 						"{:#?}",
 						event
-							.as_event::<coretime_api::broker::events::CoreAssigned>()
+							.as_event::<broker_events::CoreAssigned>()
 							.unwrap()
 							.unwrap()
 					),
-					"Pooled" => log::info!(
+					"Pooled" => log::trace!(
 						"{:#?}",
-						event.as_event::<coretime_api::broker::events::Pooled>().unwrap().unwrap()
+						event.as_event::<broker_events::Pooled>().unwrap().unwrap()
 					),
-					"ClaimsReady" => log::info!(
+					"ClaimsReady" => log::trace!(
 						"{:#?}",
 						event
-							.as_event::<coretime_api::broker::events::ClaimsReady>()
-							.unwrap()
-							.unwrap()
-					),
-					"RevenueClaimBegun" => log::info!(
-						"{:#?}",
-						event
-							.as_event::<coretime_api::broker::events::RevenueClaimBegun>()
+							.as_event::<broker_events::ClaimsReady>()
 							.unwrap()
 							.unwrap()
 					),
-					"RevenueClaimItem" => log::info!(
+					"RevenueClaimBegun" => log::trace!(
 						"{:#?}",
 						event
-							.as_event::<coretime_api::broker::events::RevenueClaimItem>()
+							.as_event::<broker_events::RevenueClaimBegun>()
 							.unwrap()
 							.unwrap()
 					),
-					"RevenueClaimPaid" => log::info!(
+					"RevenueClaimItem" => log::trace!(
 						"{:#?}",
 						event
-							.as_event::<coretime_api::broker::events::RevenueClaimPaid>()
+							.as_event::<broker_events::RevenueClaimItem>()
+							.unwrap()
+							.unwrap()
+					),
+					"RevenueClaimPaid" => log::trace!(
+						"{:#?}",
+						event
+							.as_event::<broker_events::RevenueClaimPaid>()
 							.unwrap()
 							.unwrap()
 					),
@@ -190,7 +201,7 @@ async fn wait_for_para_event<C: subxt::Config + Clone, E: StaticEvent, P: Fn(&E)
 
 async fn ti_watcher<C: subxt::Config + Clone>(api: OnlineClient<C>, prefix: &'static str)
 where
-	<C::Header as subxt::config::Header>::Number: std::fmt::Display,
+	<C::Header as subxt::config::Header>::Number: Display,
 {
 	let mut blocks_sub = api.blocks().subscribe_finalized().await.unwrap();
 
@@ -203,17 +214,29 @@ where
 		let ti = api
 			.storage()
 			.at(block.reference())
-			// .await
-			// .unwrap()
 			.fetch(&rococo_api::storage().balances().total_issuance())
 			.await
 			.unwrap()
 			.unwrap() as i128;
 
 		let diff = ti - issuance;
-		log::info!("{} #{} issuance {} ({:+})", prefix, block.number(), ti, diff);
+		if diff != 0 {
+			log::info!("{} #{} issuance {} ({:+})", prefix, block.number(), ti, diff);
+		}
 		issuance = ti;
 	}
+}
+
+async fn balance<C: subxt::Config>(api: OnlineClient<C>, acc: &AccountId32) -> u128 {
+	api.storage().at_latest().await
+	.unwrap()
+	.fetch(&rococo_api::storage()
+		.balances()
+		.account(acc.clone())
+	).await
+	.unwrap()
+	.unwrap()
+	.free
 }
 
 async fn push_tx_hard<Cll: Payload, Cfg: subxt::Config, Sgnr: Signer<Cfg>>(
@@ -223,7 +246,7 @@ async fn push_tx_hard<Cll: Payload, Cfg: subxt::Config, Sgnr: Signer<Cfg>>(
 ) -> ExtrinsicEvents<Cfg>
 where
 	<Cfg::ExtrinsicParams as ExtrinsicParams<Cfg>>::Params: Default,
-{
+{	
 	loop {
 		match cli.tx().sign_and_submit_then_watch_default(call, signer).await {
 			Ok(txp) => match txp.wait_for_finalized_success().await {
@@ -254,7 +277,7 @@ async fn main() -> Result<(), anyhow::Error> {
 			r.with_chain("rococo-local")
 				.with_default_command("polkadot")
 				.with_genesis_overrides(
-					json!({ "configuration": { "config": { "scheduler_params": { "on_demand_base_fee": 50_000_000 }}}}),
+					json!({ "configuration": { "config": { "scheduler_params": { "on_demand_base_fee": ON_DEMAND_BASE_FEE }}}}),
 				)
 				.with_node(|node| node.with_name("alice"))
 				.with_node(|node| node.with_name("bob"))
@@ -272,12 +295,10 @@ async fn main() -> Result<(), anyhow::Error> {
 		.build()
 		.unwrap()
 		.spawn_native()
-		.await?
-		// .unwrap()
-		;
+		.await?;
 
 	let relay_client: OnlineClient<PolkadotConfig> =
-		network.get_node("alice")?.wait_client().await?; //.client().await?;
+		network.get_node("alice")?.wait_client().await?;
 	let para_client: OnlineClient<PolkadotConfig> =
 		network.get_node("coretime")?.wait_client().await?;
 
@@ -308,6 +329,8 @@ async fn main() -> Result<(), anyhow::Error> {
 	let _s2 = tokio::spawn(async move {
 		ti_watcher(api, "RELAY").await;
 	});
+
+	log::info!("Initiating teleport from RC's account of Alice to PC's one");
 
 	// Teleport some Alice's tokens to the Coretime chain. Although her account is pre-funded on
 	// the PC, that is still neccessary to bootstrap RC's `CheckedAccount`.
@@ -344,8 +367,11 @@ async fn main() -> Result<(), anyhow::Error> {
 	.await;
 
 	// RC's total issuance doen't change, but PC's one increses after the teleport
+
 	total_issuance.1 += 1_500_000_000;
 	assert_total_issuance(relay_client.clone(), para_client.clone(), total_issuance).await;
+
+	log::info!("Initializing broker and starting sales");
 
 	// Initialize broker and start sales
 
@@ -384,7 +410,12 @@ async fn main() -> Result<(), anyhow::Error> {
 	)
 	.await;
 
-	// Skip the first sale completeley as it may be a short one
+	log::info!("Waiting for a full-length sale to begin");
+
+	// Skip the first sale completeley as it may be a short one. Also, `request_code_count` requires
+	// two session boundaries to propagate. Given that the `fast-runtime` session is 10 blocks and
+	// the timeslice is 20 blocks, we should be just in time.
+
 	let _: coretime_api::broker::events::SaleInitialized =
 		wait_for_para_event(para_events.clone(), "Broker", "SaleInitialized", |_| true).await;
 	log::info!("Skipped short sale");
@@ -393,7 +424,10 @@ async fn main() -> Result<(), anyhow::Error> {
 		wait_for_para_event(para_events.clone(), "Broker", "SaleInitialized", |_| true).await;
 	log::info!("{:?}", sale);
 
-	// Buy a region
+	// Alice buys a region
+	
+	log::info!("Alice is going to buy a region");
+
 	let r = push_tx_hard(
 		para_client.clone(),
 		&coretime_api::tx().broker().purchase(1_000_000_000),
@@ -403,7 +437,16 @@ async fn main() -> Result<(), anyhow::Error> {
 
 	let purchase = r.find_first::<broker_events::Purchased>()?.unwrap();
 
-	// Pool the region
+	// Somewhere below this point, the revenue from this sale will be teleported to the RC and burnt
+	// on both chains. Let's account that but not assert just yet.
+
+	total_issuance.0 -= purchase.price;
+	total_issuance.1 -= purchase.price;
+
+	// Alice pools the region
+
+	log::info!("Alice is going to put the region into the pool");
+
 	let r = push_tx_hard(
 		para_client.clone(),
 		&coretime_api::tx().broker().pool(
@@ -418,6 +461,9 @@ async fn main() -> Result<(), anyhow::Error> {
 	let pooled = r.find_first::<broker_events::Pooled>()?.unwrap();
 
 	// Wait until the beginning of the timeslice where the region belongs to
+
+	log::info!("Waiting for the region to begin");
+
 	let hist = wait_for_para_event(
 		para_events.clone(),
 		"Broker",
@@ -425,7 +471,14 @@ async fn main() -> Result<(), anyhow::Error> {
 		|e: &broker_events::HistoryInitialized| e.when == pooled.region_id.begin,
 	)
 	.await;
+
+	// Alice's private contribution should be there
+
 	assert!(hist.private_pool_size > 0);
+
+	// Bob places an order to buy insta coretime as RC
+
+	log::info!("Bob is going to buy an on-demand core");
 
 	let r = push_tx_hard(
 		relay_client.clone(),
@@ -436,14 +489,32 @@ async fn main() -> Result<(), anyhow::Error> {
 	)
 	.await;
 
-	for e in r.iter() {
-		let e = e?;
-		log::info!("RELAY EVENT {} :: {}", e.pallet_name(), e.variant_name());
-	}
+	// for e in r.iter() {
+	// 	let e = e?;
+	// 	log::info!("RELAY EVENT {} :: {}", e.pallet_name(), e.variant_name());
+	// }
 
 	let order = r
 		.find_first::<rococo_api::on_demand_assignment_provider::events::OnDemandOrderPlaced>()?
 		.unwrap();
+
+	// As there's no spot traffic, Bob will only pay base fee
+
+	assert_eq!(order.spot_price, ON_DEMAND_BASE_FEE);
+
+	// Somewhere below this point, revenue is generated and is teleported to the PC (that happens
+	// once a timeslice so we're not ready to assert it yet, let's just account). That checks out
+	// tokens from the RC and mints them on the PC.
+
+	total_issuance.1 += ON_DEMAND_BASE_FEE;
+
+	// As soon as the PC receives the tokens, it divides them half by half into system and private
+	// contributions (we have 3 cores, one is leased to Coretime itself, one is pooled by the system,
+	// and one is pooled by Alice).
+
+	// Now we're waiting for the moment when Alice may claim her revenue
+
+	log::info!("Waiting for Alice's revenue to be ready to claim");
 
 	let claims_ready = wait_for_para_event(
 		para_events.clone(),
@@ -452,7 +523,24 @@ async fn main() -> Result<(), anyhow::Error> {
 		|e: &broker_events::ClaimsReady| e.when == pooled.region_id.begin,
 	)
 	.await;
-	assert_eq!(claims_ready.private_payout, order.spot_price / 2);
+
+	// The revenue should be half of the spot price, which is equal to the base fee.
+
+	assert_eq!(claims_ready.private_payout, ON_DEMAND_BASE_FEE / 2);
+
+	// By this moment, we're sure that revenue was received by the PC and can assert the total
+	// issuance
+
+	assert_total_issuance(relay_client.clone(), para_client.clone(), total_issuance).await;
+
+	// Alice claims her revenue
+
+	log::info!("Alice is going to claim her revenue");
+
+	let relay_client: OnlineClient<PolkadotConfig> =
+		network.get_node("alice")?.wait_client().await?;
+	let para_client: OnlineClient<PolkadotConfig> =
+		network.get_node("coretime")?.wait_client().await?;
 
 	let r = push_tx_hard(
 		para_client.clone(),
@@ -461,15 +549,34 @@ async fn main() -> Result<(), anyhow::Error> {
 	)
 	.await;
 
-	let claim_paid = wait_for_para_event(
-		para_events.clone(),
-		"Broker",
-		"RevenueClaimPaid",
-		|e: &broker_events::RevenueClaimPaid| e.who == alice_acc,
-	)
-	.await;
+	let claim_paid = r.find_first::<broker_events::RevenueClaimPaid>()?.unwrap();
 
-	tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+	// let claim_paid = wait_for_para_event(
+	// 	para_events.clone(),
+	// 	"Broker",
+	// 	"RevenueClaimPaid",
+	// 	|e: &broker_events::RevenueClaimPaid| e.who == alice_acc,
+	// )
+	// .await;
+
+	assert_eq!(claim_paid.amount, ON_DEMAND_BASE_FEE / 2);
+
+	// As for the system revenue, it is teleported back to the RC and burnt there. Those burns are
+	// batched and are processed once a timeslice, after a new one starts. So we have to wait for two
+	// timeslice boundaries to pass to be sure the teleport has already happened somewhere in between.
+
+	let _: coretime_api::broker::events::SaleInitialized =
+		wait_for_para_event(para_events.clone(), "Broker", "SaleInitialized", |_| true).await;
+
+	total_issuance.0 -= ON_DEMAND_BASE_FEE / 2;
+	total_issuance.1 -= ON_DEMAND_BASE_FEE / 2;
+
+	let _: coretime_api::broker::events::SaleInitialized =
+		wait_for_para_event(para_events.clone(), "Broker", "SaleInitialized", |_| true).await;
+
+	assert_total_issuance(relay_client.clone(), para_client.clone(), total_issuance).await;
+
+	log::info!("Test finished successfuly");
 
 	Ok(())
 }
