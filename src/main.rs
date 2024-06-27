@@ -18,11 +18,7 @@ use rococo::api::runtime_types::{
 use serde_json::json;
 use std::{fmt::Display, sync::{Arc, RwLock}};
 use subxt::{
-	blocks::ExtrinsicEvents,
-	config::ExtrinsicParams,
-	events::StaticEvent,
-	tx::{Payload, Signer},
-	utils::AccountId32,
+	blocks::ExtrinsicEvents, config::ExtrinsicParams, error::{DispatchError, TransactionError}, events::StaticEvent, tx::{Payload, Signer, TxStatus}, utils::AccountId32
 };
 use subxt::{OnlineClient, PolkadotConfig};
 use subxt_signer::sr25519::dev;
@@ -247,23 +243,80 @@ async fn push_tx_hard<Cll: Payload, Cfg: subxt::Config, Sgnr: Signer<Cfg>>(
 where
 	<Cfg::ExtrinsicParams as ExtrinsicParams<Cfg>>::Params: Default,
 {	
-	loop {
-		match cli.tx().sign_and_submit_then_watch_default(call, signer).await {
-			Ok(txp) => match txp.wait_for_finalized_success().await {
-				Ok(events) => return events,
-				Err(e) => {
-					log::error!("Transaction not finalized successfuly, retrying: {e:?}");
-					tokio::time::sleep(Duration::from_secs(1)).await;
-					continue
-				},
-			},
-			Err(e) => {
-				log::error!("Retrying transaction: {e:?}");
-				tokio::time::sleep(Duration::from_secs(1)).await;
-				continue
-			},
-		}
+	let tx = cli.tx().create_signed(call, signer, Default::default()).await.expect("Signed transaction created ok");
+	log::trace!("Created tx {:?}", tx.encoded());
+	match tx.submit_and_watch().await {
+	    Ok(mut progress) => {
+	    	log::trace!("Submitted: {progress:?}");
+
+	        while let Some(status) = progress.next().await {
+	            match status {
+	                // Finalized! Return.
+	                Ok(TxStatus::InFinalizedBlock(in_block)) => {
+	                	log::trace!("Transaction is in finalized block {:?}", in_block.block_hash());
+	                	let events = in_block.fetch_events().await.expect("Events fetched successfully");
+				        for ev in events.iter() {
+				            let ev = ev.expect("Event details");
+				            if ev.pallet_name() == "System" && ev.variant_name() == "ExtrinsicFailed" {
+				                let dispatch_error =
+				                    DispatchError::decode_from(ev.field_bytes(), cli.metadata()).expect("Dispatch error");
+				                log::error!("Extrinsic failed: {dispatch_error:?}");
+				                panic!();
+				            }
+				        }
+				        return events;
+	                }
+	                // Error scenarios; return the error.
+	                Ok(TxStatus::Error { ref message }) | Ok(TxStatus::Invalid { ref message }) | Ok(TxStatus::Dropped { ref message }) => {
+	                	log::error!("Transaction ERROR {status:?}: {message}");
+	                	panic!();
+	                },
+	                Ok(s) => {
+	                	let v = match s {
+		                    TxStatus::Validated => "Validated",
+		                    TxStatus::Broadcasted { .. } => "Broadcasted",
+		                    TxStatus::NoLongerInBestBlock => "NoLongerInBestBlock",
+		                    TxStatus::InBestBlock(_) => "InBestBlock",
+		                    TxStatus::InFinalizedBlock(_) => "InFinalizedBlock",
+		                    TxStatus::Error { .. } => "Error",
+		                    TxStatus::Invalid { .. } => "Invalid",
+		                    TxStatus::Dropped { .. } => "Dropped",
+		                };
+	                	log::trace!("Transaction status IGNORED: {v}", );
+	                	continue;
+	                }
+	                Err(e) => {
+	                	log::error!("Transaction PROGRESS ERROR: {e:?}");
+	                	panic!();
+	                }
+	            }
+	        }
+	    },
+	    Err(e) => {
+	    	log::error!("Error submitting transaction: {e}");
+	    	panic!();
+	    },
 	}
+
+	panic!("Transaction not pushed");
+
+	// loop {
+	// 	match cli.tx().sign_and_submit_then_watch_default(call, signer).await {
+	// 		Ok(txp) => match txp.wait_for_finalized_success().await {
+	// 			Ok(events) => return events,
+	// 			Err(e) => {
+	// 				log::error!("Transaction not finalized successfuly, retrying: {e:?}");
+	// 				tokio::time::sleep(Duration::from_secs(1)).await;
+	// 				continue
+	// 			},
+	// 		},
+	// 		Err(e) => {
+	// 			log::error!("Retrying transaction: {e:?}");
+	// 			tokio::time::sleep(Duration::from_secs(1)).await;
+	// 			continue
+	// 		},
+	// 	}
+	// }
 }
 
 #[tokio::main]
@@ -537,10 +590,10 @@ async fn main() -> Result<(), anyhow::Error> {
 
 	log::info!("Alice is going to claim her revenue");
 
-	let relay_client: OnlineClient<PolkadotConfig> =
-		network.get_node("alice")?.wait_client().await?;
-	let para_client: OnlineClient<PolkadotConfig> =
-		network.get_node("coretime")?.wait_client().await?;
+	// let relay_client: OnlineClient<PolkadotConfig> =
+	// 	network.get_node("alice")?.wait_client().await?;
+	// let para_client: OnlineClient<PolkadotConfig> =
+	// 	network.get_node("coretime")?.wait_client().await?;
 
 	let r = push_tx_hard(
 		para_client.clone(),
@@ -558,6 +611,8 @@ async fn main() -> Result<(), anyhow::Error> {
 	// 	|e: &broker_events::RevenueClaimPaid| e.who == alice_acc,
 	// )
 	// .await;
+
+	log::info!("Revenue claimed, waiting for 2 timeslices until the system revenue is burnt");
 
 	assert_eq!(claim_paid.amount, ON_DEMAND_BASE_FEE / 2);
 
