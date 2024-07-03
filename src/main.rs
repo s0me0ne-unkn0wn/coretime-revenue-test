@@ -235,6 +235,13 @@ async fn balance<C: subxt::Config>(api: OnlineClient<C>, acc: &AccountId32) -> u
 	.free
 }
 
+async fn on_failure() {
+	// Keep the network running to diagnose the problem
+	loop {
+		tokio::time::sleep(Duration::from_secs(3600)).await;
+	}
+}
+
 async fn push_tx_hard<Cll: Payload, Cfg: subxt::Config, Sgnr: Signer<Cfg>>(
 	cli: OnlineClient<Cfg>,
 	call: &Cll,
@@ -261,7 +268,7 @@ where
 				                let dispatch_error =
 				                    DispatchError::decode_from(ev.field_bytes(), cli.metadata()).expect("Dispatch error");
 				                log::error!("Extrinsic failed: {dispatch_error:?}");
-				                panic!();
+				                on_failure().await;
 				            }
 				        }
 				        return events;
@@ -269,7 +276,7 @@ where
 	                // Error scenarios; return the error.
 	                Ok(TxStatus::Error { ref message }) | Ok(TxStatus::Invalid { ref message }) | Ok(TxStatus::Dropped { ref message }) => {
 	                	log::error!("Transaction ERROR {status:?}: {message}");
-	                	panic!();
+	                	on_failure().await;
 	                },
 	                Ok(s) => {
 	                	let v = match s {
@@ -287,14 +294,14 @@ where
 	                }
 	                Err(e) => {
 	                	log::error!("Transaction PROGRESS ERROR: {e:?}");
-	                	panic!();
+	                	on_failure().await;
 	                }
 	            }
 	        }
 	    },
 	    Err(e) => {
 	    	log::error!("Error submitting transaction: {e}");
-	    	panic!();
+	    	on_failure().await;
 	    },
 	}
 
@@ -350,10 +357,13 @@ async fn main() -> Result<(), anyhow::Error> {
 		.spawn_native()
 		.await?;
 
+	let relay_node = network.get_node("alice")?;
+	let para_node = network.get_node("coretime")?;
+
 	let relay_client: OnlineClient<PolkadotConfig> =
-		network.get_node("alice")?.wait_client().await?;
+		relay_node.wait_client().await?;
 	let para_client: OnlineClient<PolkadotConfig> =
-		network.get_node("coretime")?.wait_client().await?;
+		para_node.wait_client().await?;
 
 	// Get total issuance on both sides
 	let mut total_issuance = get_total_issuance(relay_client.clone(), para_client.clone()).await;
@@ -367,18 +377,18 @@ async fn main() -> Result<(), anyhow::Error> {
 	let bob_acc = AccountId32(bob.public_key().0);
 
 	let para_events: ParaEvents<PolkadotConfig> = Arc::new(RwLock::new(Vec::new()));
-	let p_api = para_client.clone();
+	let p_api = para_node.wait_client().await?;
 	let p_events = para_events.clone();
 
 	let _subscriber = tokio::spawn(async move {
 		para_watcher(p_api, p_events).await;
 	});
 
-	let api = para_client.clone();
+	let api: OnlineClient<PolkadotConfig> = para_node.wait_client().await?;
 	let _s1 = tokio::spawn(async move {
 		ti_watcher(api, "PARA").await;
 	});
-	let api = relay_client.clone();
+	let api: OnlineClient<PolkadotConfig> = relay_node.wait_client().await?;
 	let _s2 = tokio::spawn(async move {
 		ti_watcher(api, "RELAY").await;
 	});
