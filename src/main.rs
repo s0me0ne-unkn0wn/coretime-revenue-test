@@ -328,9 +328,8 @@ where
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-	env_logger::init_from_env(
-		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
-	);
+	// Use tracing subscriber for nicer logs from subxt/jsonrpsee
+	tracing_subscriber::fmt::try_init().unwrap();
 
 	let network = NetworkConfigBuilder::new()
 		.with_relaychain(|r| {
